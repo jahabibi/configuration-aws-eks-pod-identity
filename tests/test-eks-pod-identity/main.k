@@ -3,59 +3,41 @@ import models.io.upbound.awsm.iam.v1beta1 as iamv1beta1
 import models.io.upbound.dev.meta.v1alpha1 as metav1alpha1
 import models.io.upbound.platform.aws.v1alpha1 as platformawsv1alpha1
 
+# Stand-in for the referenced Compute's published status, supplied as an extra
+# resource so the composition resolves clusterName/region via the same
+# extra-resources path it uses in-cluster. Untyped dict on purpose — the Compute
+# model is not a dependency of this package.
+_computeExtra = {
+    apiVersion = "aws.platform.upbound.io/v1alpha1"
+    kind = "Compute"
+    metadata = {
+        name = "my-compute"
+        namespace = "default"
+    }
+    status = {
+        clusterName = "my-cluster"
+        region = "us-west-2"
+    }
+}
+
 _items = [
     metav1alpha1.CompositionTest{
-        metadata.name: ""
-        spec= {
+        metadata.name: "test-identity"
+        spec = {
             assertResources: [
-                platformawsv1alpha1.PodIdentity{
+                platformawsv1alpha1.Identity{
                     metadata = {
                         name = "configuration-aws-eks-pod-identity"
+                        namespace = "default"
                     }
                     spec = {
                         parameters = {
-                            inlinePolicy = [
-                                {
-                                    name = "default"
-                                    policy = r"""{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Action": [
-                "kms:Decrypt",
-                "kms:DescribeKey"
-            ],
-            "Effect": "Allow",
-            "Resource": "*"
-        }
-    ]
-}
-"""
-                                }
-                            ]
-                            managedPolicyArns = [
-                                "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-                            ]
-                            region = "us-west-2"
-                            serviceAccount = {
-                                name = "my-controller"
-                                namespace = "kube-system"
+                            federationType = "pod-identity"
+                            computeRef = {
+                                id = "my-compute"
                             }
+                            role = "ebs-csi"
                         }
-                    }
-                    status = {
-                        podIdentity = {
-                            clusterName = "observed-dynamic-cluster-name" # see observedResources setup below
-                        }
-                        conditions = [
-                            {
-                                lastTransitionTime = "2024-01-01T00:00:00Z"
-                                message = "Unready resources: iamRole, podIdentityAssociation"
-                                reason = "Creating"
-                                status = "False"
-                                $type = "Ready"
-                            }
-                        ]
                     }
                 }
                 iamv1beta1.Role{
@@ -67,36 +49,18 @@ _items = [
                         labels = {
                             "crossplane.io/composite" = "configuration-aws-eks-pod-identity"
                         }
-                        ownerReferences = [
-                            {
-                                apiVersion = "aws.platform.upbound.io/v1alpha1"
-                                blockOwnerDeletion = True
-                                controller = True
-                                kind = "PodIdentity"
-                                name = "configuration-aws-eks-pod-identity"
-                                uid = ""
-                            }
-                        ]
                     }
                     spec = {
                         managementPolicies = ["*"]
                         forProvider = {
-                            assumeRolePolicy = r"""{
-    "Version":"2012-10-17",
-    "Statement":[
-        {
-        "Sid":"AllowEksAuthToAssumeRoleForPodIdentity",
-        "Effect":"Allow",
-        "Principal":{
-            "Service":"pods.eks.amazonaws.com"
-        },
-        "Action":[
-            "sts:AssumeRole",
-            "sts:TagSession"
-        ]
-        }
-    ]
-}"""
+                            assumeRolePolicy = """{"Version":"2012-10-17","Statement":[{"Sid":"AllowEksAuthToAssumeRoleForPodIdentity","Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"]}]}"""
+                            managedPolicyArns = [
+                                "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+                            ]
+                        }
+                        providerConfigRef = {
+                            kind = "ProviderConfig"
+                            name = "default"
                         }
                     }
                 }
@@ -109,31 +73,17 @@ _items = [
                         labels = {
                             "crossplane.io/composite" = "configuration-aws-eks-pod-identity"
                         }
-                        ownerReferences = [
-                            {
-                                apiVersion = "aws.platform.upbound.io/v1alpha1"
-                                blockOwnerDeletion = True
-                                controller = True
-                                kind = "PodIdentity"
-                                name = "configuration-aws-eks-pod-identity"
-                                uid = ""
-                            }
-                        ]
                     }
                     spec = {
                         managementPolicies = ["*"]
                         forProvider = {
-                            clusterNameSelector = {
-                                matchLabels = {
-                                    "crossplane.io/composite" = "configuration-aws-eks-pod-identity"
-                                }
-                            }
+                            clusterName = "my-cluster"
                             namespace = "kube-system"
                             region = "us-west-2"
                             roleArnSelector = {
                                 matchControllerRef = True
                             }
-                            serviceAccount = "my-controller"
+                            serviceAccount = "ebs-csi-controller-sa"
                         }
                         providerConfigRef = {
                             kind = "ProviderConfig"
@@ -145,27 +95,8 @@ _items = [
             compositionPath: "apis/podidentities/composition.yaml"
             xrPath: "examples/podidentity/pod-identity-xr.yaml"
             xrdPath: "apis/podidentities/definition.yaml"
+            extraResources: [_computeExtra]
             timeoutSeconds: 60
-            observedResources= [
-                eksv1beta1.PodIdentityAssociation{
-                    metadata.annotations = {
-                        "crossplane.io/composition-resource-name" = "podIdentityAssociation"
-                    }
-                    spec = {
-                        forProvider = {
-                            clusterNameSelector = {
-                                matchControllerRef: True
-                            }
-                            region = "us-west-2"
-                        }
-                    }
-                    status = {
-                        atProvider = {
-                            clusterName: "observed-dynamic-cluster-name"
-                        }
-                    }
-                }
-            ]
             validate: False
         }
     }

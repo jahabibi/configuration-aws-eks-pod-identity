@@ -1,32 +1,16 @@
 apiVersion: aws.platform.upbound.io/v1alpha1
-kind: PodIdentity
+kind: Identity
 metadata:
   name: configuration-aws-eks-pod-identity
   namespace: default
 spec:
   parameters:
+    federationType: pod-identity
     region: us-west-2
-    clusterNameSelector:
-      matchLabels:
-        crossplane.io/composite: configuration-aws-eks-pod-identity
-    managedPolicyArns:
-      - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
-    inlinePolicy:
-      - name: default
-        policy: |
-          {
-              "Version": "2012-10-17",
-              "Statement": [
-                  {
-                      "Action": [
-                          "kms:Decrypt",
-                          "kms:DescribeKey"
-                      ],
-                      "Effect": "Allow",
-                      "Resource": "*"
-                  }
-              ]
-          }
-    serviceAccount:
-      name: my-controller
-      namespace: kube-system
+    # Reference the cluster by platform id; the composition resolves its
+    # published status (cluster name) via extra-resources.
+    computeRef:
+      id: my-compute
+    # Curated role -> L3 policy template + default ServiceAccount.
+    # For arbitrary IAM, set overrides.policy instead of role.
+    role: ebs-csi
