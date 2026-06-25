@@ -1,6 +1,6 @@
 # AWS EKS Pod Identity Configuration
 
-This repository contains an Upbound project, tailored for users establishing their initial control plane with [Upbound](https://cloud.upbound.io). This configuration deploys fully managed AWS EKS Pod Identity resources.
+This repository contains an Upbound project, tailored for users establishing their initial control plane with [Upbound](https://cloud.upbound.io). This configuration provisions AWS cloud identities for Kubernetes workloads (EKS Pod Identity or IRSA) behind a clean, intent-based API.
 
 ## Overview
 
@@ -12,9 +12,69 @@ The core components of a custom API in [Upbound Project](https://docs.upbound.io
 
 In this specific configuration, the API contains:
 
-- **an [AWS EKS Pod Identity](/apis/podidentities/definition.yaml) custom resource type.**
+- **an [Identity](/apis/podidentities/definition.yaml) custom resource type** (`kind: Identity`, namespaced).
 - **Composition:** Configured in [/apis/podidentities/composition.yaml](/apis/podidentities/composition.yaml)
-- **Embedded Function:** The Composition logic is encapsulated within [embedded function](/functions/eks-pod-identity/main.k)
+- **Embedded Function:** The Composition logic is encapsulated within the Python [embedded function](/functions/eks-pod-identity-py/main.py)
+
+## What changed in this rework
+
+This configuration was reworked to remove leaky AWS/Crossplane APIs from the contract and present a clean abstraction. The headline changes versus `main`:
+
+- **`kind: PodIdentity` → `kind: Identity`** (plural `identities`). The API now models *granting a workload a cloud identity*, with the federation mechanism (Pod Identity vs IRSA) as an implementation detail rather than leaked API surface.
+- **Embedded function ported from KCL to Python** (`functions/eks-pod-identity/main.k` → `functions/eks-pod-identity-py/main.py`). The role→cluster binding (`PodIdentityAssociation`) needs the cluster name resolved from the *namespaced* `Compute` XR via a cross-domain lookup. The `function-kcl` server bundled in `up` is too old to honour `matchNamespace`, so the namespaced lookup silently returned empty and the association was never created. The Python SDK speaks the Crossplane v2 `required_resources` mechanism, whose `ResourceSelector` carries a `namespace` field, and resolves the namespaced `Compute` correctly.
+- **Cluster is referenced by platform id, not Crossplane refs/selectors.** `computeRef.id` names a `Compute` (cell), and the composition resolves its published `status` (cluster name, region, OIDC provider ARN) — no `clusterNameRef`/`clusterNameSelector` machinery in the contract.
+- **Permissions are curated, not hand-rolled.** A `role` selects a platform-blessed policy template plus a default ServiceAccount. Arbitrary IAM is still possible through a bounded `overrides` escape hatch.
+- **Crossplane vocabulary no longer leaks.** `managementPolicies`/`providerConfigName` are replaced by `reclaimPolicy` (`Delete`/`Retain`, borrowed from the PersistentVolume vocabulary) and an optional `overrides.providerConfigName`.
+- **Dependency bump:** `configuration-aws-eks` pinned to `v3.0.0-dev.11`.
+
+## The Identity API
+
+```yaml
+apiVersion: aws.platform.upbound.io/v1alpha1
+kind: Identity
+metadata:
+  name: configuration-aws-eks-pod-identity
+  namespace: default
+spec:
+  parameters:
+    federationType: pod-identity     # pod-identity (default) | irsa
+    computeRef:
+      id: my-compute                 # platform id of the target Compute (cluster)
+    role: ebs-csi                     # curated permission set + default ServiceAccount
+    # region: us-west-2              # optional; resolved from Compute when omitted
+    # serviceAccount:               # optional; the curated role supplies a default
+    #   name: my-controller
+    #   namespace: kube-system
+    # reclaimPolicy: Delete         # Delete (default) | Retain
+    # overrides:                    # bounded escape hatch for unsupported cases
+    #   policy: '{ ... raw IAM JSON ... }'
+    #   managedPolicyArns: [ ... ]
+    #   providerConfigName: default
+```
+
+### Spec parameters
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `computeRef.id` | yes | Platform id (metadata name) of the `Compute` this identity targets. Cluster name/region/OIDC are resolved from its published status. |
+| `federationType` | no (default `pod-identity`) | How the ServiceAccount federates: `pod-identity` (EKS Pod Identity) or `irsa` (OIDC web-identity). |
+| `role` | no | Selects a curated permission set for a well-known workload. The function currently ships templates for `aws-lb-controller` and `ebs-csi`; the API also advertises `external-dns`, `cert-manager`, and `cluster-autoscaler`. |
+
+> **TODO:** The `role` enum advertises five workloads, but the function's role catalog (`_ROLE_CATALOG` in [`main.py`](/functions/eks-pod-identity-py/main.py)) only implements `aws-lb-controller` and `ebs-csi`. Selecting `external-dns`, `cert-manager`, or `cluster-autoscaler` currently emits an IAM role with no attached policy (unless `overrides.policy`/`overrides.managedPolicyArns` is set). Add curated templates for these entries, or trim the enum to match the catalog.
+| `serviceAccount` | no | The Kubernetes ServiceAccount granted the identity. Optional when `role` is set (the template supplies a default). |
+| `region` | no | Cloud region; resolved from `Compute` when omitted. |
+| `reclaimPolicy` | no (default `Delete`) | Outcome intent. `Retain` maps to non-destructive Crossplane management policies. |
+| `overrides.policy` | no | Raw IAM policy document (JSON) for cases no curated `role` covers. |
+| `overrides.managedPolicyArns` | no | Managed policy ARNs to attach (escape hatch). |
+| `overrides.providerConfigName` | no (default `default`) | Crossplane `ProviderConfig` for account/credential selection. |
+
+### Status
+
+| Field | Description |
+| --- | --- |
+| `roleArn` | ARN of the IAM role backing this identity. |
+| `clusterName` | Name of the cluster the identity targets. |
+| `associationId` | EKS Pod Identity association id (pod-identity federation). |
 
 ## How It Works
 
@@ -129,10 +189,11 @@ aws eks describe-pod-identity-association \
 The configuration can be tested using:
 
 - `up composition render --xrd=apis/podidentities/definition.yaml apis/podidentities/composition.yaml examples/podidentity/pod-identity-xr.yaml` to render the composition
-- `up composition render --xrd=apis/podidentities/definition.yaml apis/podidentities/composition.yaml examples/podidentity/pod-identity-xr.yaml -o examples/observed-podidentityassociation.yaml` to render composition with observed PodIdentityAssociation and test XR status propagation
-- `up composition render --xrd=apis/podidentities/definition.yaml apis/podidentities/composition.yaml examples/podidentity/pod-identity-xr.yaml` to render the composition
+- `up composition render --xrd=apis/podidentities/definition.yaml apis/podidentities/composition.yaml examples/podidentity/pod-identity-xr.yaml -o examples/podidentity/observed-podidentityassociation.yaml` to render the composition with an observed PodIdentityAssociation and test XR status propagation
 - `up test run tests/*` to run composition tests in `tests/test-eks-pod-identity/`
 - `up test run tests/* --e2e` to run end-to-end tests in `tests/e2etest-eks-pod-identity/`
+
+> The composition tests supply the referenced `Compute`'s published status as an extra resource, so the function resolves `clusterName`/`region` the same way it does in-cluster.
 
 ## Deployment
 
@@ -146,5 +207,6 @@ This repository serves as a foundational step. To enhance the configuration, con
 
 1. create new API definitions in this same repo
 2. editing the existing API definition to your needs
+3. adding curated `role` templates to the function's role catalog for more well-known workloads
 
 To learn more about how to build APIs for your managed control planes in Upbound, read the guide on [Upbound's docs](https://docs.upbound.io/).
