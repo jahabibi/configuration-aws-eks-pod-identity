@@ -9,8 +9,8 @@ spec:
   mode: Pipeline
   pipeline:
   - functionRef:
-      name: upbound-configuration-aws-eks-pod-identityeks-pod-identity
-    step: eks-pod-identity
+      name: upbound-configuration-aws-eks-pod-identityeks-pod-identity-py
+    step: eks-pod-identity-py
   - functionRef:
       name: crossplane-contrib-function-auto-ready
     step: crossplane-contrib-function-auto-ready
